@@ -48,6 +48,7 @@ struct DescaleData
     int bandwidth;
     int taps;
     double b, c;
+    int opt;
     float shift_h;
     bool process_h;
     float **upper_h;
@@ -744,6 +745,11 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
         return;
     }
 
+    d.opt = int64ToIntS(vsapi->propGetInt(in, "opt", 0, &err));
+
+    if (err)
+        d.opt = -1;
+
     d.process_h = (d.vi_dst.width == d.vi_src.width && d.shift_h == 0) ? false : true;
     d.process_v = (d.vi_dst.height == d.vi_src.height && d.shift_v == 0) ? false : true;
 
@@ -802,7 +808,7 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     d.bandwidth = support * 4 - 1;
 
 #ifdef DESCALE_X86
-    if (query_x86_capabilities().avx) {
+    if (query_x86_capabilities().avx && (d.opt == 1 || d.opt == -1)) {
         if (d.bandwidth == 3) {
             d.process_plane_h = process_plane_h_b3_avx;
             d.process_plane_v = process_plane_v_b3_avx;
@@ -813,7 +819,7 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
             d.process_plane_h = process_plane_h_avx;
             d.process_plane_v = process_plane_v_avx;
         }
-    } else if (query_x86_capabilities().avx2) {
+    } else if (query_x86_capabilities().avx2 && (d.opt == 2 || d.opt == -1)) {
         if (d.bandwidth == 3) {
             d.process_plane_h = process_plane_h_b3_avx2;
             d.process_plane_v = process_plane_v_b3_avx2;
@@ -961,7 +967,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "width:int;"
             "height:int;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(bilinear), plugin);
 
     register_func("Debicubic",
@@ -971,7 +978,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "b:float:opt;"
             "c:float:opt;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(bicubic), plugin);
 
     register_func("Delanczos",
@@ -980,7 +988,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "height:int;"
             "taps:int:opt;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(lanczos), plugin);
 
     register_func("Despline16",
@@ -988,7 +997,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "width:int;"
             "height:int;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(spline16), plugin);
 
     register_func("Despline36",
@@ -996,7 +1006,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "width:int;"
             "height:int;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(spline36), plugin);
 
     register_func("Despline64",
@@ -1004,6 +1015,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "width:int;"
             "height:int;"
             "src_left:float:opt;"
-            "src_top:float:opt",
+            "src_top:float:opt;"
+            "opt:int:opt",
             descale_create, (void *)(spline64), plugin);
 }

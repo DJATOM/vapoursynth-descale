@@ -4,26 +4,26 @@ from functools import partial
 
 # If yuv444 is True chroma will be upscaled instead of downscaled
 # If gray is True the output will be grayscale
-def Debilinear(src, width, height, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='bilinear', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Debilinear(src, width, height, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='bilinear', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
-def Debicubic(src, width, height, b=0.0, c=0.5, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='bicubic', b=b, c=c, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Debicubic(src, width, height, b=0.0, c=0.5, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='bicubic', b=b, c=c, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
-def Delanczos(src, width, height, taps=3, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='lanczos', b=None, c=None, taps=taps, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Delanczos(src, width, height, taps=3, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='lanczos', b=None, c=None, taps=taps, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
-def Despline16(src, width, height, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='spline16', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Despline16(src, width, height, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='spline16', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
-def Despline36(src, width, height, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='spline36', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Despline36(src, width, height, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='spline36', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
-def Despline64(src, width, height, yuv444=False, gray=False, chromaloc=None):
-    return Descale(src, width, height, kernel='spline64', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc)
+def Despline64(src, width, height, yuv444=False, gray=False, chromaloc=None, opt=None):
+    return Descale(src, width, height, kernel='spline64', b=None, c=None, taps=None, yuv444=yuv444, gray=gray, chromaloc=chromaloc, opt=opt)
 
 
-def Descale(src, width, height, kernel='bilinear', b=0.0, c=0.5, taps=3, yuv444=False, gray=False, chromaloc=None):
+def Descale(src, width, height, kernel='bilinear', b=0.0, c=0.5, taps=3, yuv444=False, gray=False, chromaloc=None, opt=None):
     src_f = src.format
     src_cf = src_f.color_family
     src_st = src_f.sample_type
@@ -34,10 +34,10 @@ def Descale(src, width, height, kernel='bilinear', b=0.0, c=0.5, taps=3, yuv444=
     descale_filter = get_filter(b, c, taps, kernel)
 
     if src_cf == RGB and not gray:
-        rgb = descale_filter(to_rgbs(src), width, height)
+        rgb = descale_filter(to_rgbs(src), width, height, opt=opt)
         return rgb.resize.Point(format=src_f.id)
 
-    y = descale_filter(to_grays(src), width, height)
+    y = descale_filter(to_grays(src), width, height, opt=opt)
     y_f = core.register_format(GRAY, src_st, src_bits, 0, 0)
     y = y.resize.Point(format=y_f.id)
 
