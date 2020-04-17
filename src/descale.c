@@ -18,6 +18,7 @@
 
 #ifdef DESCALE_X86
     #include "x86/cpuinfo_x86.h"
+    #include "x86/descale_avx.h"
     #include "x86/descale_avx2.h"
 #endif
 
@@ -801,7 +802,18 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     d.bandwidth = support * 4 - 1;
 
 #ifdef DESCALE_X86
-    if (query_x86_capabilities().avx2) {
+    if (query_x86_capabilities().avx) {
+        if (d.bandwidth == 3) {
+            d.process_plane_h = process_plane_h_b3_avx;
+            d.process_plane_v = process_plane_v_b3_avx;
+        } else if (d.bandwidth == 7) {
+            d.process_plane_h = process_plane_h_b7_avx;
+            d.process_plane_v = process_plane_v_b7_avx;
+        } else {
+            d.process_plane_h = process_plane_h_avx;
+            d.process_plane_v = process_plane_v_avx;
+        }
+    } else if (query_x86_capabilities().avx2) {
         if (d.bandwidth == 3) {
             d.process_plane_h = process_plane_h_b3_avx2;
             d.process_plane_v = process_plane_v_b3_avx2;

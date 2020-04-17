@@ -31,6 +31,13 @@ if host_machine.cpu_family().startswith('x86')
 
     sources += ['src/x86/cpuinfo_x86.c']
 
+    libs += static_library('descale_avx', 'src/x86/descale_avx.c',
+                dependencies: deps,
+                c_args: ['-mavx'],
+                pic: true,
+                include_directories: 'src'
+            )
+
     libs += static_library('descale_avx2', 'src/x86/descale_avx2.c',
                 dependencies: deps,
                 c_args: ['-mavx2', '-mfma'],
