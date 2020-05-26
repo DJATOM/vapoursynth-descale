@@ -993,7 +993,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(bilinear), plugin);
 
@@ -1006,7 +1006,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(bicubic), plugin);
 
@@ -1018,7 +1018,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(lanczos), plugin);
 
@@ -1029,7 +1029,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(spline16), plugin);
 
@@ -1040,7 +1040,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(spline36), plugin);
 
@@ -1051,7 +1051,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "src_left:float:opt;"
             "src_top:float:opt;"
             "src_width:float:opt;"
-            "src_height:float:opt"
+            "src_height:float:opt;"
             "opt:int:opt",
             descale_create, (void *)(spline64), plugin);
 }
