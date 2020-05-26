@@ -1,7 +1,7 @@
 project('Descale', 'c',
     default_options: ['buildtype=release', 'b_ndebug=if-release', 'c_std=c99'],
     meson_version: '>=0.51.0',
-    version: '3'
+    version: '6'
 )
 
 cc = meson.get_compiler('c')
@@ -12,15 +12,18 @@ libs = []
 
 deps = []
 
-deps += cc.find_library('m', static: true, required: false)
-
 # Don't require VS to be installed on Windows,
 # so we don't need to have VS fully installed
 # in our mingw environment. Just the header files
 # are enough.
 if host_machine.system() == 'windows'
+    # Statically link things on Windows.
+    deps += cc.find_library('m', static: true, required: false)
+    deps += cc.find_library('winpthread', static: true)
     installdir = join_paths(get_option('libdir'), 'vapoursynth')
 else
+    deps += cc.find_library('m', required: false)
+    deps += cc.find_library('pthread')
     vs = dependency('vapoursynth').partial_dependency(compile_args: true, includes: true)
     deps += vs
     installdir = join_paths(vs.get_pkgconfig_variable('libdir'), 'vapoursynth')
@@ -44,7 +47,6 @@ if host_machine.cpu_family().startswith('x86')
                 pic: true,
                 include_directories: 'src'
             )
-
 endif
 
 

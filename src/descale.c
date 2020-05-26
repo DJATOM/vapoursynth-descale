@@ -12,6 +12,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <vapoursynth/VapourSynth.h>
 #include <vapoursynth/VSHelper.h>
 #include "common.h"
@@ -23,33 +24,39 @@
 #endif
 
 
-/*#ifdef __AVX2__
-    #define process_plane_h_b3 process_plane_h_b3_avx2
-    #define process_plane_v_b3 process_plane_v_b3_avx2
-    #define process_plane_h_b7 process_plane_h_b7_avx2
-    #define process_plane_v_b7 process_plane_v_b7_avx2
-    #define process_plane_h process_plane_h_avx2
-    #define process_plane_v process_plane_v_avx2
-#else
-    #define process_plane_h_b3 process_plane_h_b3_c
-    #define process_plane_v_b3 process_plane_v_b3_c
-    #define process_plane_h_b7 process_plane_h_b7_c
-    #define process_plane_v_b7 process_plane_v_b7_c
-    #define process_plane_h process_plane_h_c
-    #define process_plane_v process_plane_v_c
-#endif*/
+enum DescaleMode
+{
+    bilinear = 0,
+    bicubic  = 1,
+    lanczos  = 2,
+    spline16 = 3,
+    spline36 = 4,
+    spline64 = 5
+};
 
 
 struct DescaleData
 {
+    bool initialized;
+    pthread_mutex_t lock;
+
     VSNodeRef *node;
     VSVideoInfo vi_src;
     VSVideoInfo vi_dst;
+
+    enum DescaleMode mode;
+    int support;
+    double param1;
+    double param2;
     int bandwidth;
     int taps;
     double b, c;
     int opt;
-    float shift_h;
+    double shift_h;
+    double shift_v;
+
+    double active_width;
+    double active_height;
     bool process_h;
     float **upper_h;
     float **lower_h;
@@ -58,7 +65,6 @@ struct DescaleData
     int *weights_h_left_idx;
     int *weights_h_right_idx;
     int weights_h_columns;
-    float shift_v;
     bool process_v;
     float **upper_v;
     float **lower_v;
@@ -76,23 +82,12 @@ struct DescaleData
 };
 
 
-enum DescaleMode
-{
-    bilinear = 0,
-    bicubic  = 1,
-    lanczos  = 2,
-    spline16 = 3,
-    spline36 = 4,
-    spline64 = 5
-};
-
-
 static void multiply_banded_matrix_with_diagonal(int rows, int bandwidth, double *matrix)
 {
-    int c = (bandwidth + 1) / 2;
+    int c = bandwidth / 2;
 
     for (int i = 1; i < rows; i++) {
-        int start = VSMAX(i - (c - 1), 0);
+        int start = VSMAX(i - c, 0);
         for (int j = start; j < i; j++) {
             matrix[i * rows + j] *= matrix[j * rows + j];
         }
@@ -107,26 +102,26 @@ static void multiply_banded_matrix_with_diagonal(int rows, int bandwidth, double
  * contains L' and D after decomposition. The main diagonal of
  * ones of L' is not saved.
 */
-static void banded_ldlt_decomposition(int rows, int bandwidth, double *matrix)
+static void banded_ldlt_decomposition(int n, int bandwidth, double *matrix)
 {
-    int c = (bandwidth + 1) / 2;
+    int c = bandwidth / 2;
     // Division by 0 can happen if shift is used
     double eps = DBL_EPSILON;
 
-    for (int i = 0; i < rows; i++) {
-        int end = VSMIN(c, rows - i);
+    for (int i = 0; i < n; i++) {
+        int end = VSMIN(c + 1, n - i);
 
         for (int j = 1; j < end; j++) {
-            double d = matrix[i * rows + i + j] / (matrix[i * rows + i] + eps);
+            double d = matrix[i * n + i + j] / (matrix[i * n + i] + eps);
 
             for (int k = 0; k < end - j; k++) {
-                matrix[(i + j) * rows + i + j + k] -= d * matrix[i * rows + i + j + k];
+                matrix[(i + j) * n + i + j + k] -= d * matrix[i * n + i + j + k];
             }
         }
 
-        double e = 1.0 / (matrix[i * rows + i] + eps);
+        double e = 1.0 / (matrix[i * n + i] + eps);
         for (int j = 1; j < end; j++) {
-                matrix[i * rows + i + j] *= e;
+                matrix[i * n + i + j] *= e;
         }
     }
 }
@@ -160,36 +155,36 @@ static void transpose_matrix(int rows, int columns, const double *matrix, double
 }
 
 
-static void extract_compressed_lower_upper_diagonal(int rows, int bandwidth, const double *lower, const double *upper, float ***compressed_lower, float ***compressed_upper, float **diagonal)
+static void extract_compressed_lower_upper_diagonal(int n, int bandwidth, const double *lower, const double *upper, float ***compressed_lower, float ***compressed_upper, float **diagonal)
 {
-    *compressed_lower = calloc(bandwidth / 2, sizeof (float *));
-    *compressed_upper = calloc(bandwidth / 2, sizeof (float *));
-    *diagonal = calloc(ceil_n(rows, 8), sizeof (float));
-    int c = (bandwidth + 1) / 2;
+    int c = bandwidth / 2;
     // Division by 0 can happen if shift is used
     double eps = DBL_EPSILON;
+    *compressed_lower = calloc(c, sizeof (float *));
+    *compressed_upper = calloc(c, sizeof (float *));
+    *diagonal = calloc(ceil_n(n, 8), sizeof (float));
 
-    for (int i = 0; i < c - 1; i++) {
-        (*compressed_lower)[i] = calloc(ceil_n(rows, 8), sizeof (float));
-        (*compressed_upper)[i] = calloc(ceil_n(rows, 8), sizeof (float));
+    for (int i = 0; i < c; i++) {
+        (*compressed_lower)[i] = calloc(ceil_n(n, 8), sizeof (float));
+        (*compressed_upper)[i] = calloc(ceil_n(n, 8), sizeof (float));
     }
 
-    for (int i = 0; i < rows; i++) {
-        int start = VSMAX(i - c + 1, 0);
-        for (int j = start; j < start + c - 1; j++) {
-            (*compressed_lower)[j - start][i] = (float)lower[i * rows + j];
+    for (int i = 0; i < n; i++) {
+        int start = VSMAX(i - c, 0);
+        for (int j = start; j < i; j++) {
+            (*compressed_lower)[j - i + c][i] = (float)lower[i * n + j];
         }
     }
 
-    for (int i = 0; i < rows; i++) {
-        int start = VSMIN(i + c - 1, rows - 1);
+    for (int i = 0; i < n; i++) {
+        int start = VSMIN(i + c, n - 1);
         for (int j = start; j > i; j--) {
-            (*compressed_upper)[c - 2 + j - start][i] = (float)upper[i * rows + j];
+            (*compressed_upper)[j - i - 1][i] = (float)upper[i * n + j];
         }
     }
 
-    for (int i = 0; i < rows; i++) {
-        (*diagonal)[i] = (float)(1.0 / (lower[i * rows + i] + eps));
+    for (int i = 0; i < n; i++) {
+        (*diagonal)[i] = (float)(1.0 / (lower[i * n + i] + eps));
     }
 
 }
@@ -275,10 +270,13 @@ static double calculate_weight(enum DescaleMode mode, int support, double distan
             return 0.0;
         }
     }
+
+    return 0.0;
 }
 
 
-// Taken from zimg https://github.com/sekrit-twc/zimg
+// Taken from zimg
+// https://github.com/sekrit-twc/zimg/blob/09802b8751c18165519d32407c498f0e3024f1f1/src/zimg/resize/filter.cpp#L33
 static double round_halfup(double x)
 {
     /* When rounding on the pixel grid, the invariant
@@ -286,19 +284,16 @@ static double round_halfup(double x)
      * must be preserved. This precludes the use of modes such as
      * half-to-even and half-away-from-zero.
      */
-    bool sign = (x < 0);
-
-    x = round(fabs(x));
-    return sign ? -x : x;
+    return x < 0 ? floor(x + 0.5) : floor(x + 0.49999999999999994);
 }
 
 
 // Most of this is taken from zimg 
 // https://github.com/sekrit-twc/zimg/blob/ce27c27f2147fbb28e417fbf19a95d3cf5d68f4f/src/zimg/resize/filter.cpp#L227
-static void scaling_weights(enum DescaleMode mode, int support, int src_dim, int dst_dim, double b, double c, double shift, double **weights)
+static void scaling_weights(enum DescaleMode mode, int support, int src_dim, int dst_dim, double param1, double param2, double shift, double active_dim, double **weights)
 {
     *weights = calloc(src_dim * dst_dim, sizeof (double));
-    double ratio = (double)dst_dim / src_dim;
+    double ratio = (double)dst_dim / active_dim;
 
     for (int i = 0; i < dst_dim; i++) {
 
@@ -307,7 +302,7 @@ static void scaling_weights(enum DescaleMode mode, int support, int src_dim, int
         double begin_pos = round_halfup(pos - support) + 0.5;
         for (int j = 0; j < 2 * support; j++) {
             double xpos = begin_pos + j;
-            total += calculate_weight(mode, support, xpos - pos, b, c);
+            total += calculate_weight(mode, support, xpos - pos, param1, param2);
         }
         for (int j = 0; j < 2 * support; j++) {
             double xpos = begin_pos + j;
@@ -322,7 +317,7 @@ static void scaling_weights(enum DescaleMode mode, int support, int src_dim, int
                 real_pos = xpos;
 
             int idx = (int)floor(real_pos);
-            (*weights)[i * src_dim + idx] += calculate_weight(mode, support, xpos - pos, b, c) / total;
+            (*weights)[i * src_dim + idx] += calculate_weight(mode, support, xpos - pos, param1, param2) / total;
         }
     }
 }
@@ -382,10 +377,10 @@ static void process_plane_h_b7_c(int width, int current_height, int *current_wid
                 sum -= lower[1][j] * dstp[j - 2];
                 sum -= lower[2][j] * dstp[j - 1];
             } else if (j > 1) {
-                sum -= lower[0][j] * dstp[j - 2];
-                sum -= lower[1][j] * dstp[j - 1];
+                sum -= lower[1][j] * dstp[j - 2];
+                sum -= lower[2][j] * dstp[j - 1];
             } else if (j > 0) {
-                sum -= lower[0][j] * dstp[j - 1];
+                sum -= lower[2][j] * dstp[j - 1];
             }
 
             dstp[j] = sum * diagonal[j];
@@ -400,10 +395,10 @@ static void process_plane_h_b7_c(int width, int current_height, int *current_wid
                 sum += upper[2][j] * dstp[j + 3];
             }
             else if (j < width - 2) {
-                sum += upper[1][j] * dstp[j + 1];
-                sum += upper[2][j] * dstp[j + 2];}
+                sum += upper[0][j] * dstp[j + 1];
+                sum += upper[1][j] * dstp[j + 2];}
             else if (j < width - 1) {
-                sum += upper[2][j] * dstp[j + 1];
+                sum += upper[0][j] * dstp[j + 1];
             }
 
             dstp[j] -= sum;
@@ -421,12 +416,12 @@ static void process_plane_h_c(int width, int current_height, int *current_width,
                               int weights_columns, float * VS_RESTRICT weights, float * VS_RESTRICT * VS_RESTRICT lower, float * VS_RESTRICT * VS_RESTRICT upper,
                               float * VS_RESTRICT diagonal, const int src_stride, const int dst_stride, const float * VS_RESTRICT srcp, float * VS_RESTRICT dstp)
 {
-    int c = (bandwidth + 1) / 2;
+    int c = bandwidth / 2;
 
     for (int i = 0; i < current_height; i++) {
         for (int j = 0; j < width; j++) {
             float sum = 0.0f;
-            int start = VSMAX(0, j - c + 1);
+            int start = VSMAX(0, j - c);
 
             // A' b
             for (int k = weights_left_idx[j]; k < weights_right_idx[j]; k++)
@@ -434,7 +429,7 @@ static void process_plane_h_c(int width, int current_height, int *current_width,
 
             // Solve LD y = A' b
             for (int k = start; k < j; k++) {
-                sum -= lower[k - start][j] * dstp[k];
+                sum -= lower[k - j + c][j] * dstp[k];
             }
 
             dstp[j] = sum * diagonal[j];
@@ -443,10 +438,10 @@ static void process_plane_h_c(int width, int current_height, int *current_width,
         // Solve L' x = y
         for (int j = width - 2; j >= 0; j--) {
             float sum = 0.0f;
-            int start = VSMIN(width - 1, j + c - 1);
+            int start = VSMIN(width - 1, j + c);
 
             for (int k = start; k > j; k--) {
-                sum += upper[k - start + c - 2][j] * dstp[k];
+                sum += upper[k - j - 1][j] * dstp[k];
             }
 
             dstp[j] -= sum;
@@ -511,10 +506,10 @@ static void process_plane_v_b7_c(int height, int current_width, int *current_hei
                 sum -= lower[1][i] * dstp[(i - 2) * dst_stride + j];
                 sum -= lower[2][i] * dstp[(i - 1) * dst_stride + j];
             } else if (i > 1) {
-                sum -= lower[0][i] * dstp[(i - 2) * dst_stride + j];
-                sum -= lower[1][i] * dstp[(i - 1) * dst_stride + j];
+                sum -= lower[1][i] * dstp[(i - 2) * dst_stride + j];
+                sum -= lower[2][i] * dstp[(i - 1) * dst_stride + j];
             } else if (i > 0) {
-                sum -= lower[0][i] * dstp[(i - 1) * dst_stride + j];
+                sum -= lower[2][i] * dstp[(i - 1) * dst_stride + j];
             }
 
             dstp[i * dst_stride +j] = sum * diagonal[i];
@@ -529,12 +524,11 @@ static void process_plane_v_b7_c(int height, int current_width, int *current_hei
                 sum += upper[0][i] * dstp[(i + 1) * dst_stride + j];
                 sum += upper[1][i] * dstp[(i + 2) * dst_stride + j];
                 sum += upper[2][i] * dstp[(i + 3) * dst_stride + j];
-            }
-            else if (i < height - 2) {
-                sum += upper[1][i] * dstp[(i + 1) * dst_stride + j];
-                sum += upper[2][i] * dstp[(i + 2) * dst_stride + j];}
-            else if (i < height - 1) {
-                sum += upper[2][i] * dstp[(i + 1) * dst_stride + j];
+            } else if (i < height - 2) {
+                sum += upper[0][i] * dstp[(i + 1) * dst_stride + j];
+                sum += upper[1][i] * dstp[(i + 2) * dst_stride + j];
+            } else if (i < height - 1) {
+                sum += upper[0][i] * dstp[(i + 1) * dst_stride + j];
             }
 
             dstp[i * dst_stride + j] -= sum;
@@ -549,12 +543,12 @@ static void process_plane_v_c(int height, int current_width, int *current_height
                               int weights_columns, float * VS_RESTRICT weights, float * VS_RESTRICT * VS_RESTRICT lower, float * VS_RESTRICT * VS_RESTRICT upper,
                               float * VS_RESTRICT diagonal, const int src_stride, const int dst_stride, const float * VS_RESTRICT srcp, float * VS_RESTRICT dstp)
 {
-    int c = (bandwidth + 1) / 2;
+    int c = bandwidth / 2;
 
     for (int j = 0; j < height; j++) {
         for (int i = 0; i < current_width; i++) {
             float sum = 0.0f;
-            int start = VSMAX(0, j - c + 1);
+            int start = VSMAX(0, j - c);
 
             // A' b
             for (int k = weights_left_idx[j]; k < weights_right_idx[j]; ++k)
@@ -562,7 +556,7 @@ static void process_plane_v_c(int height, int current_width, int *current_height
 
             // Solve LD y = A' b
             for (int k = start; k < j; k++) {
-                sum -= lower[k - start][j] * dstp[k * dst_stride + i];
+                sum -= lower[k - j + c][j] * dstp[k * dst_stride + i];
             }
 
             dstp[j * dst_stride + i] = sum * diagonal[j];
@@ -574,10 +568,10 @@ static void process_plane_v_c(int height, int current_width, int *current_height
     for (int j = height - 2; j >= 0; j--) {
         for (int i = 0; i < current_width; i++) {
             float sum = 0.0f;
-            int start = VSMIN(height - 1, j + c - 1);
+            int start = VSMIN(height - 1, j + c);
 
             for (int k = start; k > j; k--) {
-                sum += upper[k - start + c - 2][j] * dstp[k * dst_stride + i];
+                sum += upper[k - j - 1][j] * dstp[k * dst_stride + i];
             }
 
             dstp[j * dst_stride + i] -= sum;
@@ -585,6 +579,116 @@ static void process_plane_v_c(int height, int current_width, int *current_height
     }
 
     *current_height = height;
+}
+
+
+static void initialize_descale_data(struct DescaleData *d)
+{
+    if (d->process_h) {
+        double *weights;
+        double *transposed_weights;
+        double *multiplied_weights;
+        double *lower;
+
+        scaling_weights(d->mode, d->support, d->vi_dst.width, d->vi_src.width, d->param1, d->param2, d->shift_h, d->active_width, &weights);
+        transpose_matrix(d->vi_src.width, d->vi_dst.width, weights, &transposed_weights);
+
+        d->weights_h_left_idx = calloc(ceil_n(d->vi_dst.width, 8), sizeof (int));
+        d->weights_h_right_idx = calloc(ceil_n(d->vi_dst.width, 8), sizeof (int));
+        for (int i = 0; i < d->vi_dst.width; i++) {
+            for (int j = 0; j < d->vi_src.width; j++) {
+                if (transposed_weights[i * d->vi_src.width + j] != 0.0) {
+                    d->weights_h_left_idx[i] = j;
+                    break;
+                }
+            }
+            for (int j = d->vi_src.width - 1; j >= 0; j--) {
+                if (transposed_weights[i * d->vi_src.width + j] != 0.0) {
+                    d->weights_h_right_idx[i] = j + 1;
+                    break;
+                }
+            }
+        }
+
+        multiply_sparse_matrices(d->vi_dst.width, d->vi_src.width, d->weights_h_left_idx, d->weights_h_right_idx, transposed_weights, weights, &multiplied_weights);
+        banded_ldlt_decomposition(d->vi_dst.width, d->bandwidth, multiplied_weights);
+        transpose_matrix(d->vi_dst.width, d->vi_dst.width, multiplied_weights, &lower);
+        multiply_banded_matrix_with_diagonal(d->vi_dst.width, d->bandwidth, lower);
+
+        int max = 0;
+        for (int i = 0; i < d->vi_dst.width; i++) {
+            int diff = d->weights_h_right_idx[i] - d->weights_h_left_idx[i];
+            if (diff > max)
+                max = diff;
+        }
+        d->weights_h_columns = max;
+        d->weights_h = calloc(ceil_n(d->vi_dst.width, 8) * max, sizeof (float));
+        for (int i = 0; i < d->vi_dst.width; i++) {
+            for (int j = 0; j < d->weights_h_right_idx[i] - d->weights_h_left_idx[i]; j++) {
+                d->weights_h[i * max + j] = (float)transposed_weights[i * d->vi_src.width + d->weights_h_left_idx[i] + j];
+            }
+        }
+
+        extract_compressed_lower_upper_diagonal(d->vi_dst.width, d->bandwidth, lower, multiplied_weights, &d->lower_h, &d->upper_h, &d->diagonal_h);
+
+        free(weights);
+        free(transposed_weights);
+        free(multiplied_weights);
+        free(lower);
+    }
+
+    if (d->process_v) {
+        double *weights;
+        double *transposed_weights;
+        double *multiplied_weights;
+        double *lower;
+
+        scaling_weights(d->mode, d->support, d->vi_dst.height, d->vi_src.height, d->param1, d->param2, d->shift_v, d->active_height, &weights);
+        transpose_matrix(d->vi_src.height, d->vi_dst.height, weights, &transposed_weights);
+
+        d->weights_v_left_idx = calloc(ceil_n(d->vi_dst.height, 8), sizeof (int));
+        d->weights_v_right_idx = calloc(ceil_n(d->vi_dst.height, 8), sizeof (int));
+        for (int i = 0; i < d->vi_dst.height; i++) {
+            for (int j = 0; j < d->vi_src.height; j++) {
+                if (transposed_weights[i * d->vi_src.height + j] != 0.0) {
+                    d->weights_v_left_idx[i] = j;
+                    break;
+                }
+            }
+            for (int j = d->vi_src.height - 1; j >= 0; j--) {
+                if (transposed_weights[i * d->vi_src.height + j] != 0.0) {
+                    d->weights_v_right_idx[i] = j + 1;
+                    break;
+                }
+            }
+        }
+
+        multiply_sparse_matrices(d->vi_dst.height, d->vi_src.height, d->weights_v_left_idx, d->weights_v_right_idx, transposed_weights, weights, &multiplied_weights);
+        banded_ldlt_decomposition(d->vi_dst.height, d->bandwidth, multiplied_weights);
+        transpose_matrix(d->vi_dst.height, d->vi_dst.height, multiplied_weights, &lower);
+        multiply_banded_matrix_with_diagonal(d->vi_dst.height, d->bandwidth, lower);
+
+        int max = 0;
+        for (int i = 0; i < d->vi_dst.height; i++) {
+            int diff = d->weights_v_right_idx[i] - d->weights_v_left_idx[i];
+            if (diff > max)
+                max = diff;
+        }
+        d->weights_v_columns = max;
+        d->weights_v = calloc(ceil_n(d->vi_dst.height, 8) * max, sizeof (float));
+        for (int i = 0; i < d->vi_dst.height; i++) {
+            for (int j = 0; j < d->weights_v_right_idx[i] - d->weights_v_left_idx[i]; j++) {
+                d->weights_v[i * max + j] = (float)transposed_weights[i * d->vi_src.height + d->weights_v_left_idx[i] + j];
+            }
+        }
+
+        extract_compressed_lower_upper_diagonal(d->vi_dst.height, d->bandwidth, lower, multiplied_weights, &d->lower_v, &d->upper_v, &d->diagonal_v);
+
+        free(weights);
+        free(transposed_weights);
+        free(multiplied_weights);
+        free(lower);
+    }
 }
 
 
@@ -596,13 +700,22 @@ static const VSFrameRef *VS_CC descale_get_frame(int n, int activationReason, vo
         vsapi->requestFrameFilter(n, d->node, frame_ctx);
 
     } else if (activationReason == arAllFramesReady) {
+        if (!d->initialized) {
+            pthread_mutex_lock(&d->lock);
+            if (!d->initialized) {
+                initialize_descale_data(d);
+                d->initialized = true;
+            }
+            pthread_mutex_unlock(&d->lock);
+        }
+
         const VSFrameRef *src = vsapi->getFrameFilter(n, d->node, frame_ctx);
         const VSFormat *fi = d->vi_src.format;
 
         VSFrameRef *intermediate = vsapi->newVideoFrame(fi, d->vi_dst.width, d->vi_src.height, NULL, core);
         VSFrameRef *dst = vsapi->newVideoFrame(fi, d->vi_dst.width, d->vi_dst.height, src, core);
 
-        for (int plane = 0; plane < d->vi_src.format->numPlanes; ++plane) {
+        for (int plane = 0; plane < d->vi_src.format->numPlanes; plane++) {
             int current_width = vsapi->getFrameWidth(src, plane);
             int current_height = vsapi->getFrameHeight(src, plane);
 
@@ -669,30 +782,35 @@ static void VS_CC descale_free(void *instance_data, VSCore *core, const VSAPI *v
     struct DescaleData *d = (struct DescaleData *)instance_data;
 
     vsapi->freeNode(d->node);
-    if (d->process_h) {
-        free(d->weights_h);
-        free(d->weights_h_left_idx);
-        free(d->weights_h_right_idx);
-        free(d->diagonal_h);
-        for (int i = 0; i < d->bandwidth / 2; i++) {
-            free(d->lower_h[i]);
-            free(d->upper_h[i]);
+
+    if (d->initialized) {
+        if (d->process_h) {
+            free(d->weights_h);
+            free(d->weights_h_left_idx);
+            free(d->weights_h_right_idx);
+            free(d->diagonal_h);
+            for (int i = 0; i < d->bandwidth / 2; i++) {
+                free(d->lower_h[i]);
+                free(d->upper_h[i]);
+            }
+            free(d->lower_h);
+            free(d->upper_h);
         }
-        free(d->lower_h);
-        free(d->upper_h);
-    }
-    if (d->process_v) {
-        free(d->weights_v);
-        free(d->weights_v_left_idx);
-        free(d->weights_v_right_idx);
-        free(d->diagonal_v);
-        for (int i = 0; i < d->bandwidth / 2; i++) {
-            free(d->lower_v[i]);
-            free(d->upper_v[i]);
+        if (d->process_v) {
+            free(d->weights_v);
+            free(d->weights_v_left_idx);
+            free(d->weights_v_right_idx);
+            free(d->diagonal_v);
+            for (int i = 0; i < d->bandwidth / 2; i++) {
+                free(d->lower_v[i]);
+                free(d->upper_v[i]);
+            }
+            free(d->lower_v);
+            free(d->upper_v);
         }
-        free(d->lower_v);
-        free(d->upper_v);
     }
+
+    pthread_mutex_destroy(&d->lock);
 
     free(d);
 }
@@ -716,7 +834,6 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     }
 
     d.vi_dst.width = int64ToIntS(vsapi->propGetInt(in, "width", 0, NULL));
-
     d.vi_dst.height = int64ToIntS(vsapi->propGetInt(in, "height", 0, NULL));
 
     d.shift_h = vsapi->propGetFloat(in, "src_left", 0, &err);
@@ -727,20 +844,28 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     if (err)
         d.shift_v = 0;
 
-    if (d.vi_dst.width < 1 || d.vi_dst.height < 1) {
-        vsapi->setError(out, "Descale: width and height must be bigger than 0.");
-        vsapi->freeNode(d.node);
-        return;
-    }
+    d.active_width = vsapi->propGetFloat(in, "src_width", 0, &err);
+    if (err)
+        d.active_width = d.vi_dst.width;
 
-    if (d.vi_dst.width > d.vi_src.width || d.vi_dst.height > d.vi_src.height) {
-        vsapi->setError(out, "Descale: Output dimension has to be smaller than or equal to input dimension.");
+    d.active_height = vsapi->propGetFloat(in, "src_height", 0, &err);
+    if (err)
+        d.active_height = d.vi_dst.height;
+
+    if (d.vi_dst.width < 1) {
+        vsapi->setError(out, "Descale: width must be greater than 0.");
         vsapi->freeNode(d.node);
         return;
     }
 
     if (d.vi_dst.height < 8) {
-        vsapi->setError(out, "Descale: Output height has to be greater or equal to 8");
+        vsapi->setError(out, "Descale: Output height must be greater than or equal to 8.");
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    if (d.vi_dst.width > d.vi_src.width || d.vi_dst.height > d.vi_src.height) {
+        vsapi->setError(out, "Descale: Output dimension must be less than or equal to input dimension.");
         vsapi->freeNode(d.node);
         return;
     }
@@ -753,59 +878,61 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     d.process_h = (d.vi_dst.width == d.vi_src.width && d.shift_h == 0) ? false : true;
     d.process_v = (d.vi_dst.height == d.vi_src.height && d.shift_v == 0) ? false : true;
 
-    int support;
     char *funcname;
 
     if (mode == bilinear) {
-        support = 1;
+        d.support = 1;
         funcname = "Debilinear";
     
     } else if (mode == bicubic) {
-        d.b = vsapi->propGetFloat(in, "b", 0, &err);
+        d.param1 = vsapi->propGetFloat(in, "b", 0, &err);
         if (err)
-            d.b = 0.0;
+            d.param1 = 0.0;
 
-        d.c = vsapi->propGetFloat(in, "c", 0, &err);
+        d.param2 = vsapi->propGetFloat(in, "c", 0, &err);
         if (err)
-            d.c = 0.5;
+            d.param2 = 0.5;
 
-        support = 2;
+        d.support = 2;
         funcname = "Debicubic";
 
         // If b != 0 Bicubic is not an interpolation filter, so force processing
-        if (d.b != 0) {
+        if (d.param1 != 0) {
             d.process_h = true;
             d.process_v = true;
         }
 
     } else if (mode == lanczos) {
-        d.taps = int64ToIntS(vsapi->propGetInt(in, "taps", 0, &err));
+        d.support = int64ToIntS(vsapi->propGetInt(in, "taps", 0, &err));
         if (err)
-            d.taps = 3;
+            d.support = 3;
 
-        if (d.taps < 1) {
-            vsapi->setError(out, "Descale: taps must be bigger than 0.");
+        if (d.support < 1) {
+            vsapi->setError(out, "Descale: taps must be greater than 0.");
             vsapi->freeNode(d.node);
             return;
         }
 
-        support = d.taps;
         funcname = "Delanczos";
 
     } else if (mode == spline16) {
-        support = 2;
+        d.support = 2;
         funcname = "Despline16";
 
     } else if (mode == spline36) {
-        support = 3;
+        d.support = 3;
         funcname = "Despline36";
 
     } else if (mode == spline64) {
-        support = 4;
+        d.support = 4;
         funcname = "Despline64";
+    } else {
+        d.support = 0;
+        funcname = "none";
     }
 
-    d.bandwidth = support * 4 - 1;
+    d.mode = mode;
+    d.bandwidth = d.support * 4 - 1;
 
 #ifdef DESCALE_X86
     if (query_x86_capabilities().avx && (d.opt == 1 || d.opt == -1)) {
@@ -846,111 +973,8 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *user_data, V
     }
 #endif
 
-    if (d.process_h) {
-        double *weights;
-        double *transposed_weights;
-        double *multiplied_weights;
-        double *lower;
-
-        scaling_weights(mode, support, d.vi_dst.width, d.vi_src.width, d.b, d.c, d.shift_h, &weights);
-        transpose_matrix(d.vi_src.width, d.vi_dst.width, weights, &transposed_weights);
-
-        d.weights_h_left_idx = calloc(ceil_n(d.vi_dst.width, 8), sizeof (int));
-        d.weights_h_right_idx = calloc(ceil_n(d.vi_dst.width, 8), sizeof (int));
-        for (int i = 0; i < d.vi_dst.width; i++) {
-            for (int j = 0; j < d.vi_src.width; j++) {
-                if (transposed_weights[i * d.vi_src.width + j] != 0.0) {
-                    d.weights_h_left_idx[i] = j;
-                    break;
-                }
-            }
-            for (int j = d.vi_src.width - 1; j >= 0; j--) {
-                if (transposed_weights[i * d.vi_src.width + j] != 0.0) {
-                    d.weights_h_right_idx[i] = j + 1;
-                    break;
-                }
-            }
-        }
-
-        multiply_sparse_matrices(d.vi_dst.width, d.vi_src.width, d.weights_h_left_idx, d.weights_h_right_idx, transposed_weights, weights, &multiplied_weights);
-        banded_ldlt_decomposition(d.vi_dst.width, d.bandwidth, multiplied_weights);
-        transpose_matrix(d.vi_dst.width, d.vi_dst.width, multiplied_weights, &lower);
-        multiply_banded_matrix_with_diagonal(d.vi_dst.width, d.bandwidth, lower);
-
-        int max = 0;
-        for (int i = 0; i < d.vi_dst.width; i++) {
-            int diff = d.weights_h_right_idx[i] - d.weights_h_left_idx[i];
-            if (diff > max)
-                max = diff;
-        }
-        d.weights_h_columns = max;
-        d.weights_h = calloc(ceil_n(d.vi_dst.width, 8) * max, sizeof (float));
-        for (int i = 0; i < d.vi_dst.width; i++) {
-            for (int j = 0; j < d.weights_h_right_idx[i] - d.weights_h_left_idx[i]; j++) {
-                d.weights_h[i * max + j] = (float)transposed_weights[i * d.vi_src.width + d.weights_h_left_idx[i] + j];
-            }
-        }
-
-        extract_compressed_lower_upper_diagonal(d.vi_dst.width, d.bandwidth, lower, multiplied_weights, &d.lower_h, &d.upper_h, &d.diagonal_h);
-
-        free(weights);
-        free(transposed_weights);
-        free(multiplied_weights);
-        free(lower);
-    }
-
-    if (d.process_v) {
-        double *weights;
-        double *transposed_weights;
-        double *multiplied_weights;
-        double *lower;
-
-        scaling_weights(mode, support, d.vi_dst.height, d.vi_src.height, d.b, d.c, d.shift_v, &weights);
-        transpose_matrix(d.vi_src.height, d.vi_dst.height, weights, &transposed_weights);
-
-        d.weights_v_left_idx = calloc(ceil_n(d.vi_dst.height, 8), sizeof (int));
-        d.weights_v_right_idx = calloc(ceil_n(d.vi_dst.height, 8), sizeof (int));
-        for (int i = 0; i < d.vi_dst.height; i++) {
-            for (int j = 0; j < d.vi_src.height; j++) {
-                if (transposed_weights[i * d.vi_src.height + j] != 0.0) {
-                    d.weights_v_left_idx[i] = j;
-                    break;
-                }
-            }
-            for (int j = d.vi_src.height - 1; j >= 0; j--) {
-                if (transposed_weights[i * d.vi_src.height + j] != 0.0) {
-                    d.weights_v_right_idx[i] = j + 1;
-                    break;
-                }
-            }
-        }
-
-        multiply_sparse_matrices(d.vi_dst.height, d.vi_src.height, d.weights_v_left_idx, d.weights_v_right_idx, transposed_weights, weights, &multiplied_weights);
-        banded_ldlt_decomposition(d.vi_dst.height, d.bandwidth, multiplied_weights);
-        transpose_matrix(d.vi_dst.height, d.vi_dst.height, multiplied_weights, &lower);
-        multiply_banded_matrix_with_diagonal(d.vi_dst.height, d.bandwidth, lower);
-
-        int max = 0;
-        for (int i = 0; i < d.vi_dst.height; i++) {
-            int diff = d.weights_v_right_idx[i] - d.weights_v_left_idx[i];
-            if (diff > max)
-                max = diff;
-        }
-        d.weights_v_columns = max;
-        d.weights_v = calloc(ceil_n(d.vi_dst.height, 8) * max, sizeof (float));
-        for (int i = 0; i < d.vi_dst.height; i++) {
-            for (int j = 0; j < d.weights_v_right_idx[i] - d.weights_v_left_idx[i]; j++) {
-                d.weights_v[i * max + j] = (float)transposed_weights[i * d.vi_src.height + d.weights_v_left_idx[i] + j];
-            }
-        }
-
-        extract_compressed_lower_upper_diagonal(d.vi_dst.height, d.bandwidth, lower, multiplied_weights, &d.lower_v, &d.upper_v, &d.diagonal_v);
-
-        free(weights);
-        free(transposed_weights);
-        free(multiplied_weights);
-        free(lower);
-    }
+    d.initialized = false;
+    pthread_mutex_init(&d.lock, NULL);
 
     struct DescaleData *data = malloc(sizeof d);
     *data = d;
@@ -968,6 +992,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "height:int;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(bilinear), plugin);
 
@@ -979,6 +1005,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "c:float:opt;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(bicubic), plugin);
 
@@ -989,6 +1017,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "taps:int:opt;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(lanczos), plugin);
 
@@ -998,6 +1028,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "height:int;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(spline16), plugin);
 
@@ -1007,6 +1039,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "height:int;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(spline36), plugin);
 
@@ -1016,6 +1050,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin config_func, VSRegist
             "height:int;"
             "src_left:float:opt;"
             "src_top:float:opt;"
+            "src_width:float:opt;"
+            "src_height:float:opt"
             "opt:int:opt",
             descale_create, (void *)(spline64), plugin);
 }
